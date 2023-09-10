@@ -1,0 +1,8 @@
+chromadb
+InstructorEmbedding
+langchain
+sentence_transformers
+transformers
+youtube-transcript-api
+einops
+fire
