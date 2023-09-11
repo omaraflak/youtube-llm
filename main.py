@@ -1,7 +1,7 @@
 import fire
 from typing import Optional
 from dataclasses import dataclass
-from youtube import YouTubeVideo, Metadata
+from youtube_transcript_api import YouTubeTranscriptApi
 from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
 from langchain.embeddings import HuggingFaceInstructEmbeddings
@@ -15,14 +15,7 @@ from langchain.vectorstores import Chroma
 @dataclass
 class ChatResponse:
     text: str
-    metadata: list[Metadata]
-
-
-def run_chain(chain: ConversationalRetrievalChain, query: str) -> ChatResponse:
-    response = chain({"question": query})
-    output = response["answer"]
-    sources = response["source_documents"]
-    return ChatResponse(output, [Metadata.from_dict(source.metadata) for source in sources])
+    links: list[str]
 
 
 def load_vector_db() -> Chroma:
@@ -31,38 +24,9 @@ def load_vector_db() -> Chroma:
         embedding_function=HuggingFaceInstructEmbeddings(
             model_name="hkunlp/instructor-large",
             query_instruction="Represent the query for retrieval: ",
-            model_kwargs={"device": "cpu"},
+            model_kwargs={"device": "cuda"},
             encode_kwargs={"normalize_embeddings": True}
         )
-    )
-
-
-def load_chain() -> ConversationalRetrievalChain:
-    template = """
-    You are a helpful AI assistant that provides answers to questions based on the given context.
-
-    Context:{context}
-
-    >>QUESTION<<{question}
-    >>ANSWER<<
-    """.strip()
-
-    prompt = PromptTemplate(input_variables=["context", "question"], template=template)
-    return ConversationalRetrievalChain.from_llm(
-        llm=HuggingFacePipeline.from_model_id(
-            model_id="tiiuae/falcon-7b-instruct",
-            task="text-generation",
-            model_kwargs={"max_length": 1000, "do_sample": False, "trust_remote_code": True}
-        ),
-        retriever=load_vector_db().as_retriever(),
-        memory=ConversationBufferMemory(
-            memory_key="chat_history", 
-            input_key="question", 
-            output_key="answer", 
-            return_messages=True
-        ),
-        return_source_documents=True,
-        combine_docs_chain_kwargs={"prompt": prompt}
     )
 
 
@@ -74,28 +38,60 @@ def insert_in_vector_db(documents: list[Document], batch_size: int = 150):
         database.add_documents(documents=page_splits[i : i + batch_size])
 
 
+def load_chain() -> ConversationalRetrievalChain:
+    template = """
+    You are a helpful AI assistant that provides answers based on the following context:
+
+    {context}
+
+    Question: {question}
+    Answer:
+    """.strip()
+
+    prompt = PromptTemplate(input_variables=["context", "question"], template=template)
+    return ConversationalRetrievalChain.from_llm(
+        llm=HuggingFacePipeline.from_model_id(
+            model_id="tiiuae/falcon-7b-instruct",
+            task="text-generation",
+            model_kwargs={"max_length": 300, "do_sample": False, "trust_remote_code": True}
+        ),
+        retriever=load_vector_db().as_retriever(),
+        memory=ConversationBufferMemory(
+            memory_key="chat_history",
+            input_key="question",
+            output_key="answer",
+            return_messages=True
+        ),
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": prompt}
+    )
+
+def run_chain(chain: ConversationalRetrievalChain, query: str) -> ChatResponse:
+    response = chain({"question": query})
+    return ChatResponse(
+        response["answer"],
+        [source.metadata["link"] for source in response["source_documents"]]
+    )
+
+
 def documents_from_youtube(youtube_uid: str) -> list[Document]:
+    link = lambda t: f"https://www.youtube.com/watch?v={youtube_uid}&t={t}s"
     return [
         Document(
-            page_content=text.text,
-            metadata=text.to_metadata(youtube_uid).to_dict()
+            page_content=json.get("text"),
+            metadata={"link": link(int(json.get("start")))}
         )
-        for text in YouTubeVideo.from_uid(youtube_uid).transcript.texts
+        for json in YouTubeTranscriptApi.get_transcript(youtube_uid)
     ]
 
 
 def chat_loop():
     chain = load_chain()
     while True:
-        query = input("> ")
+        query = input("query: ")
         if query == "exit":
-            break
-
-        response = run_chain(chain, query)
-        print(response.text, end="\n\n")
-        for meta in response.metadata:
-            print(meta.link)
-        print("")
+            return
+        print(run_chain(chain, query), end="\n\n")
 
 
 def main(youtube_uid: Optional[str] = None):
